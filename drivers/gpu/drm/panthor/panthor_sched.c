@@ -349,6 +349,32 @@ struct panthor_syncobj_64b {
 };
 
 /**
+ * struct panthor_queue_slot_data - Per-job data collected by the FW.
+ */
+struct panthor_queue_slot_data {
+	/** @pre: Data collected before the job execution. */
+	/** @post: Data collected after the job execution. */
+	struct {
+		/** @timestamp: Pre/post job timestamp. */
+		u64 timestamp;
+
+		/** @cycle_count: Pre/post job cycle_counter. */
+		u64 cycle_counter;
+	} pre, post;
+};
+
+/**
+ * struct panthor_queue_data - Queue related data shared with the GPU/FW
+ */
+struct panthor_queue_data {
+	/** @sync: The sync object used to track job progress. */
+	struct panthor_syncobj_64b sync;
+
+	/** @slots: Per job-slot data. */
+	struct panthor_queue_slot_data slots[0];
+};
+
+/**
  * struct panthor_queue - Execution queue
  */
 struct panthor_queue {
@@ -391,6 +417,13 @@ struct panthor_queue {
 
 	/** @ringbuf: Command stream ring-buffer. */
 	struct panthor_kernel_bo *ringbuf;
+
+	/**
+	 * @data: Various data related to the queue and shared with the FW/GPU.
+	 *
+	 * Contains a struct panthor_queue_data object.
+	 */
+	struct panthor_kernel_bo *data;
 
 	/** @iface: Firmware interface. */
 	struct {
@@ -568,14 +601,6 @@ struct panthor_group {
 	 */
 	bool timedout;
 
-	/**
-	 * @syncobjs: Pool of per-queue synchronization objects.
-	 *
-	 * One sync object per queue. The position of the sync object is
-	 * determined by the queue index.
-	 */
-	struct panthor_kernel_bo *syncobjs;
-
 	/** @state: Group state. */
 	enum panthor_group_state state;
 
@@ -628,6 +653,15 @@ struct panthor_group {
 	 * panthor_group::groups::waiting list.
 	 */
 	struct list_head wait_node;
+
+	/** @fdinfo: fdinfo related fields. */
+	struct {
+		/** @lock: Lock protecting access to the stats field. */
+		struct mutex lock;
+
+		/** @stats: fdinfo stats. */
+		struct panthor_file_stats *stats;
+	} fdinfo;
 };
 
 /**
@@ -809,6 +843,9 @@ static void group_free_queue(struct panthor_group *group, struct panthor_queue *
 
 	panthor_queue_put_syncwait_obj(queue);
 
+	if (!IS_ERR_OR_NULL(queue->data))
+		panthor_kernel_bo_destroy(group->vm, queue->data);
+
 	if (!IS_ERR_OR_NULL(queue->ringbuf))
 		panthor_kernel_bo_destroy(group->vm, queue->ringbuf);
 
@@ -833,10 +870,8 @@ static void group_release_work(struct work_struct *work)
 	if (group->protm_suspend_buf)
 		panthor_kernel_bo_destroy(panthor_fw_vm(ptdev), group->protm_suspend_buf);
 
-	if (!IS_ERR_OR_NULL(group->syncobjs))
-		panthor_kernel_bo_destroy(group->vm, group->syncobjs);
-
 	panthor_vm_put(group->vm);
+	mutex_destroy(&group->fdinfo.lock);
 	kfree(group);
 }
 
@@ -1854,7 +1889,7 @@ tick_ctx_init(struct panthor_scheduler *sched,
 	}
 }
 
-#define NUM_INSTRS_PER_SLOT		16
+#define NUM_INSTRS_PER_SLOT		32
 
 static void
 group_term_post_processing(struct panthor_group *group)
@@ -1871,6 +1906,7 @@ group_term_post_processing(struct panthor_group *group)
 	for (i = 0; i < group->queue_count; i++) {
 		struct panthor_queue *queue = group->queues[i];
 		struct panthor_syncobj_64b *syncobj;
+		struct panthor_queue_data *qdata;
 		int err;
 
 		if (group->fatal_queues & BIT(i))
@@ -1892,7 +1928,8 @@ group_term_post_processing(struct panthor_group *group)
 		spin_unlock(&queue->fence_ctx.lock);
 
 		/* Manually update the syncobj seqno to unblock waiters. */
-		syncobj = group->syncobjs->kmap + (i * sizeof(*syncobj));
+		qdata = queue->data->kmap;
+		syncobj = &qdata->sync;
 		syncobj->status = ~0;
 		syncobj->seqno = atomic64_read(&queue->fence_ctx.seqno);
 		sched_queue_work(group->ptdev->scheduler, sync_upd);
@@ -2645,6 +2682,37 @@ void panthor_sched_post_reset(struct panthor_device *ptdev)
 	sched_queue_work(sched, sync_upd);
 }
 
+static u32 job_get_ringbuf_slot(struct panthor_job *job)
+{
+	struct panthor_group *group = job->group;
+	struct panthor_queue *queue = group->queues[job->queue_idx];
+	size_t ringbuf_size = panthor_kernel_bo_size(queue->ringbuf);
+
+	return (job->ringbuf.start & (ringbuf_size - 1)) /
+	       (NUM_INSTRS_PER_SLOT * sizeof(u64));
+}
+
+static void update_fdinfo_stats(struct panthor_job *job)
+{
+	struct panthor_group *group = job->group;
+	struct panthor_queue *queue = group->queues[job->queue_idx];
+	struct panthor_queue_data *qdata = queue->data->kmap;
+	u32 slot = job_get_ringbuf_slot(job);
+	struct panthor_file_stats *stats;
+
+	mutex_lock(&group->fdinfo.lock);
+
+	/* fdinfo will be NULL if the group was destroyed. */
+	stats = group->fdinfo.stats;
+	if (stats) {
+		stats->cycles += qdata->slots[slot].post.cycle_counter -
+				 qdata->slots[slot].pre.cycle_counter;
+		stats->time += qdata->slots[slot].post.timestamp -
+			       qdata->slots[slot].pre.timestamp;
+	}
+	mutex_unlock(&group->fdinfo.lock);
+}
+
 static void group_sync_upd_work(struct work_struct *work)
 {
 	struct panthor_group *group =
@@ -2658,11 +2726,13 @@ static void group_sync_upd_work(struct work_struct *work)
 	for (queue_idx = 0; queue_idx < group->queue_count; queue_idx++) {
 		struct panthor_queue *queue = group->queues[queue_idx];
 		struct panthor_syncobj_64b *syncobj;
+		struct panthor_queue_data *qdata;
 
 		if (!queue)
 			continue;
 
-		syncobj = group->syncobjs->kmap + (queue_idx * sizeof(*syncobj));
+		qdata = queue->data->kmap;
+		syncobj = &qdata->sync;
 
 		spin_lock(&queue->fence_ctx.lock);
 		list_for_each_entry_safe(job, job_tmp, &queue->fence_ctx.in_flight_jobs, node) {
@@ -2680,6 +2750,7 @@ static void group_sync_upd_work(struct work_struct *work)
 	dma_fence_end_signalling(cookie);
 
 	list_for_each_entry_safe(job, job_tmp, &done_jobs, node) {
+		update_fdinfo_stats(job);
 		list_del_init(&job->node);
 		panthor_job_put(&job->base);
 	}
@@ -2697,11 +2768,17 @@ queue_run_job(struct drm_sched_job *sched_job)
 	struct panthor_scheduler *sched = ptdev->scheduler;
 	u32 ringbuf_size = panthor_kernel_bo_size(queue->ringbuf);
 	u32 ringbuf_insert = queue->iface.input->insert & (ringbuf_size - 1);
+	u32 ringbuf_index = ringbuf_insert / (NUM_INSTRS_PER_SLOT * sizeof(u64));
 	u64 addr_reg = ptdev->csif_info.cs_reg_count -
 		       ptdev->csif_info.unpreserved_cs_reg_count;
 	u64 val_reg = addr_reg + 2;
-	u64 sync_addr = panthor_kernel_bo_gpuva(group->syncobjs) +
-			job->queue_idx * sizeof(struct panthor_syncobj_64b);
+	u64 qdata_addr = panthor_kernel_bo_gpuva(queue->data);
+	u64 sync_addr = qdata_addr + offsetof(struct panthor_queue_data, sync);
+	u64 slot_data_addr = qdata_addr +
+			     offsetof(struct panthor_queue_data, slots[0]) +
+			     sizeof(struct panthor_queue_slot_data) * ringbuf_index;
+	u64 cycle_reg = addr_reg;
+	u64 time_reg = val_reg;
 	u32 waitall_mask = GENMASK(sched->sb_slot_count - 1, 0);
 	struct dma_fence *done_fence;
 	int ret;
@@ -2712,6 +2789,20 @@ queue_run_job(struct drm_sched_job *sched_job)
 
 		/* FLUSH_CACHE2.clean_inv_all.no_wait.signal(0) rX+2 */
 		(36ull << 56) | (0ull << 48) | (val_reg << 40) | (0 << 16) | 0x233,
+
+		/* MOV48 rX:rX+1, cycles_offset */
+		(1ull << 56) | (cycle_reg << 48) |
+		(slot_data_addr + offsetof(struct panthor_queue_slot_data, pre.cycle_counter)),
+
+		/* MOV48 rX:rX+1, time_offset */
+		(1ull << 56) | (time_reg << 48) |
+		(slot_data_addr + offsetof(struct panthor_queue_slot_data, pre.timestamp)),
+
+		/* STORE_STATE cycles */
+		(40ull << 56) |  (cycle_reg << 40) | (1ll << 32),
+
+		/* STORE_STATE timer */
+		(40ull << 56) |  (time_reg << 40) | (0ll << 32),
 
 		/* MOV48 rX:rX+1, cs.start */
 		(1ull << 56) | (addr_reg << 48) | job->call_info.start,
@@ -2725,14 +2816,28 @@ queue_run_job(struct drm_sched_job *sched_job)
 		/* CALL rX:rX+1, rX+2 */
 		(32ull << 56) | (addr_reg << 40) | (val_reg << 32),
 
-		/* MOV48 rX:rX+1, sync_addr */
-		(1ull << 56) | (addr_reg << 48) | sync_addr,
+		/* WAIT(all) */
+		(3ull << 56) | (waitall_mask << 16),
+
+		/* MOV48 rX:rX+1, cycles_offset */
+		(1ull << 56) | (cycle_reg << 48) |
+		(slot_data_addr + offsetof(struct panthor_queue_slot_data, post.cycle_counter)),
+
+		/* MOV48 rX:rX+1, time_offset */
+		(1ull << 56) | (time_reg << 48) |
+		(slot_data_addr + offsetof(struct panthor_queue_slot_data, post.timestamp)),
+
+		/* STORE_STATE cycles */
+		(40ull << 56) |  (cycle_reg << 40) | (1ll << 32),
+
+		/* STORE_STATE timer */
+		(40ull << 56) |  (time_reg << 40) | (0ll << 32),
 
 		/* MOV48 rX+2, #1 */
 		(1ull << 56) | (val_reg << 48) | 1,
 
-		/* WAIT(all) */
-		(3ull << 56) | (waitall_mask << 16),
+		/* MOV48 rX:rX+1, sync_addr */
+		(1ull << 56) | (addr_reg << 48) | sync_addr,
 
 		/* SYNC_ADD64.system_scope.propage_err.nowait rX:rX+1, rX+2*/
 		(51ull << 56) | (0ull << 48) | (addr_reg << 40) | (val_reg << 32) | (0 << 16) | 1,
@@ -2874,6 +2979,7 @@ group_create_queue(struct panthor_group *group,
 {
 	struct drm_gpu_scheduler *drm_sched;
 	struct panthor_queue *queue;
+	u32 slot_count, data_size;
 	int ret;
 
 	if (args->pad[0] || args->pad[1] || args->pad[2])
@@ -2890,6 +2996,9 @@ group_create_queue(struct panthor_group *group,
 	if (!queue)
 		return ERR_PTR(-ENOMEM);
 
+	slot_count = args->ringbuf_size / (NUM_INSTRS_PER_SLOT * sizeof(u64));
+	data_size = sizeof(struct panthor_queue_data) +
+		    (slot_count * sizeof(struct panthor_queue_slot_data));
 	queue->fence_ctx.id = dma_fence_context_alloc(1);
 	spin_lock_init(&queue->fence_ctx.lock);
 	INIT_LIST_HEAD(&queue->fence_ctx.in_flight_jobs);
@@ -2911,6 +3020,22 @@ group_create_queue(struct panthor_group *group,
 	if (ret)
 		goto err_free_queue;
 
+	queue->data = panthor_kernel_bo_create(group->ptdev, group->vm, data_size,
+					       DRM_PANTHOR_BO_NO_MMAP,
+					       DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC |
+					       DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED,
+					       PANTHOR_VM_KERNEL_AUTO_VA);
+	if (IS_ERR(queue->data)) {
+		ret = PTR_ERR(queue->data);
+		goto err_free_queue;
+	}
+
+	ret = panthor_kernel_bo_vmap(queue->data);
+	if (ret)
+		goto err_free_queue;
+
+	memset(queue->data->kmap, 0, data_size);
+
 	queue->iface.mem = panthor_fw_alloc_queue_iface_mem(group->ptdev,
 							    &queue->iface.input,
 							    &queue->iface.output,
@@ -2924,8 +3049,7 @@ group_create_queue(struct panthor_group *group,
 	ret = drm_sched_init(&queue->scheduler, &panthor_queue_sched_ops,
 			     group->ptdev->scheduler->drm_sched_wq,
 			     DRM_SCHED_PRIORITY_MIN + 1,
-			     args->ringbuf_size / (NUM_INSTRS_PER_SLOT * sizeof(u64)),
-			     0, msecs_to_jiffies(JOB_TIMEOUT_MS),
+			     slot_count, 0, msecs_to_jiffies(JOB_TIMEOUT_MS),
 			     group->ptdev->reset.wq,
 			     NULL, "panthor-queue", group->ptdev->base.dev);
 	if (ret)
@@ -2976,6 +3100,7 @@ int panthor_group_create(struct panthor_file *pfile,
 	if (!group)
 		return -ENOMEM;
 
+	mutex_init(&group->fdinfo.lock);
 	spin_lock_init(&group->fatal_lock);
 	kref_init(&group->refcount);
 	group->state = PANTHOR_CS_GROUP_CREATED;
@@ -2989,6 +3114,7 @@ int panthor_group_create(struct panthor_file *pfile,
 	group->max_tiler_cores = group_args->max_tiler_cores;
 	group->tiler_core_mask = group_args->tiler_core_mask;
 	group->priority = group_args->priority;
+	group->fdinfo.stats = &pfile->stats;
 
 	INIT_LIST_HEAD(&group->wait_node);
 	INIT_LIST_HEAD(&group->run_node);
@@ -3017,25 +3143,6 @@ int panthor_group_create(struct panthor_file *pfile,
 		group->protm_suspend_buf = NULL;
 		goto err_put_group;
 	}
-
-	group->syncobjs = panthor_kernel_bo_create(ptdev, group->vm,
-						   group_args->queues.count *
-						   sizeof(struct panthor_syncobj_64b),
-						   DRM_PANTHOR_BO_NO_MMAP,
-						   DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC |
-						   DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED,
-						   PANTHOR_VM_KERNEL_AUTO_VA);
-	if (IS_ERR(group->syncobjs)) {
-		ret = PTR_ERR(group->syncobjs);
-		goto err_put_group;
-	}
-
-	ret = panthor_kernel_bo_vmap(group->syncobjs);
-	if (ret)
-		goto err_put_group;
-
-	memset(group->syncobjs->kmap, 0,
-	       group_args->queues.count * sizeof(struct panthor_syncobj_64b));
 
 	for (i = 0; i < group_args->queues.count; i++) {
 		group->queues[i] = group_create_queue(group, &queue_args[i]);
@@ -3103,6 +3210,14 @@ int panthor_group_destroy(struct panthor_file *pfile, u32 group_handle)
 	}
 	mutex_unlock(&sched->lock);
 	mutex_unlock(&sched->reset.lock);
+
+	/* The group might outlive the panthor_file object which contains the
+	 * fdinfo stats. We need to set this field to NULL to avoid UAF
+	 * situations.
+	 */
+	mutex_lock(&group->fdinfo.lock);
+	group->fdinfo.stats = NULL;
+	mutex_unlock(&group->fdinfo.lock);
 
 	group_put(group);
 	return 0;

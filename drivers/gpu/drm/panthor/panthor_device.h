@@ -149,6 +149,20 @@ struct panthor_device {
 		 */
 		u32 *dummy_latest_flush;
 	} pm;
+
+	unsigned long current_frequency;
+	unsigned long fast_rate;
+};
+
+/**
+ * struct panthor_file_stats - Per file statistics
+ */
+struct panthor_file_stats {
+	/** @time: Time spent by queues on the GPU. */
+	u64 time;
+
+	/** @cycles: GPU cycles spent executing jobs. */
+	u64 cycles;
 };
 
 /**
@@ -163,6 +177,9 @@ struct panthor_file {
 
 	/** @groups: Scheduling group pool attached to this file. */
 	struct panthor_group_pool *groups;
+
+	/** @stats: cycle and timestamp measures for job execution. */
+	struct panthor_file_stats stats;
 };
 
 int panthor_device_init(struct panthor_device *ptdev);
