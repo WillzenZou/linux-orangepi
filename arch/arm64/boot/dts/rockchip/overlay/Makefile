@@ -83,7 +83,8 @@ dtbo-$(CONFIG_ARCH_ROCKCHIP) += \
 	rk3588-disable-led.dtbo \
 	rk3588-opi5plus-disable-leds.dtbo \
 	rk3588-opi5pro-disable-leds.dtbo \
-	rk3588-opi5pro-sfc.dtbo
+	rk3588-opi5pro-sfc.dtbo \
+	rk3588s-rk806-panthor.dtbo
 
 scr-$(CONFIG_ARCH_ROCKCHIP) += \
 	rk3588-fixup.scr
